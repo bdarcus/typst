@@ -13,7 +13,7 @@ use hayagriva::{
     SpecificLocator, TransparentLocator, citationberg,
 };
 use indexmap::IndexMap;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use typst_syntax::{Span, Spanned, SyntaxMode};
 use typst_utils::{ManuallyHash, NonZeroExt, PicoStr};
@@ -54,8 +54,8 @@ use crate::text::{Lang, LocalName, Region, SmallcapsElem, SubElem, SuperElem, Te
 /// - A BibLaTeX `.bib` file.
 ///
 /// By default, Typst processes citations with its built-in `{hayagriva}`
-/// engine. The optional `engine` parameter is reserved as an extension point
-/// for other citation engines. Currently, only `{hayagriva}` is supported.
+/// engine. The optional `engine` parameter can select an experimental Citum
+/// backend with `{citum}`.
 ///
 /// As soon as you add a bibliography somewhere in your document, you can start
 /// citing things with reference syntax (`[@key]`) or explicit calls to the
@@ -113,16 +113,23 @@ pub struct BibliographyElem {
     #[required]
     #[parse(
         let citation_engine = args.named("engine")?.unwrap_or_default();
-        let sources = args.expect("sources")?;
-        Bibliography::load(engine.world, sources, citation_engine)?
+        let sources: Spanned<OneOrMultiple<DataSource>> = args.expect("sources")?;
+        let citum_style = match citation_engine {
+            CitationEngine::Hayagriva => None,
+            CitationEngine::Citum => match args.named::<Spanned<DataSource>>("style")? {
+                Some(source) => Some(source),
+                None => bail!(sources.span, "citation engine \"citum\" requires a style"),
+            },
+        };
+        Bibliography::load(engine.world, sources, citation_engine, citum_style)?
     )]
     pub sources: Derived<OneOrMultiple<DataSource>, Bibliography>,
 
     /// The citation engine to use.
     ///
     /// The default engine is `{hayagriva}`, which is Typst's built-in citation
-    /// processor. The `{citum}` engine name is reserved for future support, but
-    /// is not available yet.
+    /// processor. The `{citum}` engine is experimental and currently renders
+    /// Citum's plain-text output as Typst text.
     #[external]
     #[default(CitationEngine::Hayagriva)]
     pub engine: CitationEngine,
@@ -219,10 +226,7 @@ impl BibliographyElem {
         let mut vec = vec![];
         for elem in introspector.query(&Self::ELEM.select()).iter() {
             let this = elem.to_packed::<Self>().unwrap();
-            for (key, entry) in this.sources.derived.iter() {
-                let detail = entry.title().map(|title| title.value.to_str().into());
-                vec.push((key, detail))
-            }
+            vec.extend(this.sources.derived.keys());
         }
         vec
     }
@@ -273,6 +277,8 @@ impl LocalName for Packed<BibliographyElem> {
 pub enum Bibliography {
     /// Bibliography data decoded for the built-in Hayagriva engine.
     Hayagriva(HayagrivaBibliography),
+    /// Bibliography data decoded for the experimental Citum engine.
+    Citum(CitumBibliography),
 }
 
 impl Bibliography {
@@ -281,6 +287,7 @@ impl Bibliography {
         world: Tracked<dyn World + '_>,
         sources: Spanned<OneOrMultiple<DataSource>>,
         engine: CitationEngine,
+        citum_style: Option<Spanned<DataSource>>,
     ) -> SourceResult<Derived<OneOrMultiple<DataSource>, Self>> {
         let bibliography = match engine {
             CitationEngine::Hayagriva => {
@@ -288,10 +295,10 @@ impl Bibliography {
                 Self::Hayagriva(HayagrivaBibliography::decode(&loaded)?)
             }
             CitationEngine::Citum => {
-                bail!(
-                    sources.span,
-                    "citation engine \"citum\" is reserved but not yet available"
-                )
+                let loaded = sources.load(world)?;
+                let style_source = citum_style.expect("Citum style should be parsed");
+                let style = style_source.load(world)?;
+                Self::Citum(CitumBibliography::decode(&loaded, &style)?)
             }
         };
         Ok(Derived::new(sources.v, bibliography))
@@ -300,21 +307,47 @@ impl Bibliography {
     fn engine(&self) -> CitationEngine {
         match self {
             Self::Hayagriva(..) => CitationEngine::Hayagriva,
+            Self::Citum(..) => CitationEngine::Citum,
         }
     }
 
     fn as_hayagriva(&self) -> &HayagrivaBibliography {
         match self {
             Self::Hayagriva(bibliography) => bibliography,
+            Self::Citum(..) => unreachable!("expected Hayagriva bibliography"),
+        }
+    }
+
+    fn as_citum(&self) -> &CitumBibliography {
+        match self {
+            Self::Citum(bibliography) => bibliography,
+            Self::Hayagriva(..) => unreachable!("expected Citum bibliography"),
         }
     }
 
     fn has(&self, key: Label) -> bool {
-        self.as_hayagriva().has(key)
+        match self {
+            Self::Hayagriva(bibliography) => bibliography.has(key),
+            Self::Citum(bibliography) => bibliography.has(key),
+        }
     }
 
-    fn iter(&self) -> impl Iterator<Item = (Label, &hayagriva::Entry)> {
-        self.as_hayagriva().iter()
+    fn keys(&self) -> Vec<(Label, Option<EcoString>)> {
+        match self {
+            Self::Hayagriva(bibliography) => bibliography
+                .iter()
+                .map(|(key, entry)| {
+                    let detail = entry.title().map(|title| title.value.to_str().into());
+                    (key, detail)
+                })
+                .collect(),
+            Self::Citum(bibliography) => bibliography
+                .iter_keys()
+                .filter_map(|key| {
+                    Label::new(PicoStr::intern(key)).map(|label| (label, None))
+                })
+                .collect(),
+        }
     }
 }
 
@@ -323,6 +356,9 @@ impl Debug for Bibliography {
         match self {
             Self::Hayagriva(bibliography) => {
                 f.debug_tuple("Hayagriva").field(bibliography).finish()
+            }
+            Self::Citum(bibliography) => {
+                f.debug_tuple("Citum").field(bibliography).finish()
             }
         }
     }
@@ -392,6 +428,128 @@ impl Debug for HayagrivaBibliography {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_set().entries(self.0.keys()).finish()
     }
+}
+
+/// Bibliography data decoded for Citum.
+#[derive(Clone, PartialEq, Hash)]
+pub struct CitumBibliography(Arc<ManuallyHash<CitumBibliographyData>>);
+
+/// Loaded Citum bibliography data and style.
+#[derive(Debug)]
+struct CitumBibliographyData {
+    references: citum_engine::Bibliography,
+    style: citum_engine::Style,
+}
+
+impl CitumBibliography {
+    /// Decode a bibliography from loaded data sources and a loaded Citum style.
+    #[comemo::memoize]
+    #[typst_macros::time(name = "load citum bibliography")]
+    fn decode(data: &[Loaded], style: &Loaded) -> SourceResult<CitumBibliography> {
+        let mut references = citum_engine::Bibliography::new();
+        let mut duplicates = Vec::<EcoString>::new();
+
+        for loaded in data {
+            for (key, reference) in decode_citum_bibliography(loaded)? {
+                if references.insert(key.clone(), reference).is_some() {
+                    duplicates.push(key.into());
+                }
+            }
+        }
+
+        if !duplicates.is_empty() {
+            let span = data.first().unwrap().source.span;
+            bail!(span, "duplicate bibliography keys: {}", duplicates.join(", "));
+        }
+
+        let style_data = citum_engine::Style::from_yaml_bytes(style.data.as_slice())
+            .map_err(|err| {
+                LoadError::new(ReportPos::None, "failed to load Citum style", err)
+            })
+            .within(style)?;
+
+        Ok(CitumBibliography(Arc::new(ManuallyHash::new(
+            CitumBibliographyData { references, style: style_data },
+            typst_utils::hash128(&(data, style)),
+        ))))
+    }
+
+    fn has(&self, key: Label) -> bool {
+        self.0.references.contains_key(key.resolve().as_str())
+    }
+
+    fn iter_keys(&self) -> impl Iterator<Item = &str> {
+        self.0.references.keys().map(String::as_str)
+    }
+
+    fn references(&self) -> &citum_engine::Bibliography {
+        &self.0.references
+    }
+
+    fn style(&self) -> &citum_engine::Style {
+        &self.0.style
+    }
+
+    fn is_note_style(&self) -> bool {
+        matches!(
+            self.style().options.as_ref().map(|options| &options.processing),
+            Some(Some(citum_engine::Processing::Note)),
+        )
+    }
+}
+
+impl Debug for CitumBibliography {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_set().entries(self.0.references.keys()).finish()
+    }
+}
+
+/// Decode Citum bibliography data from one data source.
+fn decode_citum_bibliography(
+    loaded: &Loaded,
+) -> SourceResult<citum_engine::Bibliography> {
+    let bytes = loaded.data.as_slice();
+
+    if let LoadSource::Path(file_id) = loaded.source.v {
+        let ext = file_id.vpath().extension().unwrap_or_default();
+        match ext.to_lowercase().as_str() {
+            "json" => serde_json::from_slice(bytes)
+                .map_err(format_citum_json_error)
+                .within(loaded),
+            "yml" | "yaml" => serde_yaml::from_slice(bytes)
+                .map_err(format_citum_yaml_error)
+                .within(loaded),
+            _ => bail!(
+                loaded.source.span,
+                "unknown Citum bibliography format (must be .json, .yaml, or .yml)"
+            ),
+        }
+    } else {
+        match serde_json::from_slice(bytes) {
+            Ok(references) => Ok(references),
+            Err(json_err) => serde_yaml::from_slice(bytes)
+                .map_err(|yaml_err| {
+                    LoadError::new(
+                        ReportPos::None,
+                        "failed to parse Citum bibliography",
+                        format!(
+                            "not valid Citum JSON ({json_err}) or Citum YAML ({yaml_err})"
+                        ),
+                    )
+                })
+                .within(loaded),
+        }
+    }
+}
+
+/// Format a Citum JSON loading error.
+fn format_citum_json_error(error: serde_json::Error) -> LoadError {
+    LoadError::new(ReportPos::None, "failed to parse Citum JSON", error)
+}
+
+/// Format a Citum YAML loading error.
+fn format_citum_yaml_error(error: serde_yaml::Error) -> LoadError {
+    LoadError::new(ReportPos::None, "failed to parse Citum YAML", error)
 }
 
 /// Decode on library from one data source.
@@ -671,9 +829,7 @@ impl Works {
             CitationEngine::Hayagriva => {
                 HayagrivaBackend::generate(world, bibliography, groups)
             }
-            CitationEngine::Citum => {
-                bail!("citation engine \"citum\" is reserved but not yet available")
-            }
+            CitationEngine::Citum => CitumBackend::generate(world, bibliography, groups),
         }
     }
 
@@ -750,6 +906,245 @@ impl CitationEngineBackend for HayagrivaBackend {
         let rendered = generator.drive();
         let works = generator.display(&rendered)?;
         Ok(Arc::new(works))
+    }
+}
+
+/// Citum citation engine backend.
+struct CitumBackend;
+
+impl CitationEngineBackend for CitumBackend {
+    fn generate(
+        _world: Tracked<dyn World + '_>,
+        bibliography: Packed<BibliographyElem>,
+        groups: EcoVec<Content>,
+    ) -> StrResult<Arc<Works>> {
+        let database = bibliography.sources.derived.as_citum().clone();
+        let mut generator = CitumGenerator::new(database, bibliography, groups);
+        let works = generator.generate()?;
+        Ok(Arc::new(works))
+    }
+}
+
+/// Context for generating the bibliography with Citum.
+struct CitumGenerator {
+    /// The document's Citum bibliography.
+    database: CitumBibliography,
+    /// The document's bibliography element.
+    bibliography: Packed<BibliographyElem>,
+    /// The document's citation groups.
+    groups: EcoVec<Content>,
+    /// Details about each citation group in document order.
+    infos: Vec<CitumGroupInfo>,
+    /// Citations with unresolved keys or unsupported options.
+    failures: FxHashMap<Location, SourceResult<Content>>,
+    /// Cited keys in document order.
+    cited: Vec<String>,
+}
+
+/// Details about a Citum citation group.
+struct CitumGroupInfo {
+    /// The group's location.
+    location: Location,
+    /// The group's span.
+    span: Span,
+    /// Whether all citations in the group were hidden.
+    hidden: bool,
+}
+
+impl CitumGenerator {
+    /// Create a new Citum generator.
+    fn new(
+        database: CitumBibliography,
+        bibliography: Packed<BibliographyElem>,
+        groups: EcoVec<Content>,
+    ) -> Self {
+        Self {
+            database,
+            bibliography,
+            groups,
+            infos: Vec::new(),
+            failures: FxHashMap::default(),
+            cited: Vec::new(),
+        }
+    }
+
+    /// Generate all Citum citations and references.
+    fn generate(&mut self) -> StrResult<Works> {
+        let citations = self.collect_citations();
+        let processor = citum_engine::Processor::new(
+            self.database.style().clone(),
+            self.database.references().clone(),
+        );
+
+        let rendered = processor
+            .process_citations_with_format::<citum_engine::render::plain::PlainText>(
+                &citations,
+            )
+            .map_err(|err| eco_format!("failed to process Citum citations: {err}"))?;
+
+        let citations = self.display_citations(&rendered);
+        let references = self.display_references(&processor);
+        Ok(Works {
+            citations,
+            references: Some(references),
+            hanging_indent: false,
+        })
+    }
+
+    /// Convert Typst citation groups into Citum citation requests.
+    fn collect_citations(&mut self) -> Vec<citum_engine::Citation> {
+        let mut citations = Vec::new();
+
+        for (index, elem) in self.groups.iter().enumerate() {
+            let group = elem.to_packed::<CiteGroup>().unwrap();
+            let location = elem.location().unwrap();
+            let children = &group.children;
+            let Some(first) = children.first() else { continue };
+
+            let mut items = Vec::with_capacity(children.len());
+            let mut errors = EcoVec::new();
+            let mut hidden = true;
+            let mut prose = false;
+            let mut normal = false;
+
+            for child in children {
+                if matches!(child.style.get_ref(StyleChain::default()), Smart::Custom(_))
+                {
+                    errors.push(error!(
+                        child.span(),
+                        "per-citation style overrides are not supported by citation engine \"citum\"",
+                    ));
+                    continue;
+                }
+
+                let key = child.key.resolve().to_string();
+                if !self.database.references().contains_key(&key) {
+                    errors.push(error!(
+                        child.span(),
+                        "key `{}` does not exist in the bibliography",
+                        child.key.resolve(),
+                    ));
+                    continue;
+                }
+
+                let form = child.form.get(StyleChain::default());
+                let citation_hidden = form.is_none();
+                match form {
+                    None => {}
+                    Some(CitationForm::Normal) => normal = true,
+                    Some(CitationForm::Prose) => prose = true,
+                    Some(_) => {
+                        errors.push(error!(
+                            child.span(),
+                            "citation form is not supported by citation engine \"citum\"",
+                        ));
+                        continue;
+                    }
+                }
+
+                hidden &= citation_hidden;
+                self.cited.push(key.clone());
+
+                items.push(citum_engine::CitationItem {
+                    id: key,
+                    suffix: child
+                        .supplement
+                        .get_cloned(StyleChain::default())
+                        .map(|content| content.plain_text().to_string()),
+                    ..Default::default()
+                });
+            }
+
+            if prose && normal {
+                errors.push(error!(
+                    first.span(),
+                    "mixed prose and normal citation forms are not supported by citation engine \"citum\"",
+                ));
+            }
+
+            if !errors.is_empty() {
+                self.failures.insert(location, Err(errors));
+                continue;
+            }
+
+            self.infos
+                .push(CitumGroupInfo { location, span: first.span(), hidden });
+
+            citations.push(citum_engine::Citation {
+                id: Some(format!("typst-{index}")),
+                mode: if prose {
+                    citum_engine::reference::CitationMode::Integral
+                } else {
+                    citum_engine::reference::CitationMode::NonIntegral
+                },
+                items,
+                ..Default::default()
+            });
+        }
+
+        citations
+    }
+
+    /// Display the Citum citation strings as Typst content.
+    fn display_citations(
+        &mut self,
+        rendered: &[String],
+    ) -> FxHashMap<Location, SourceResult<Content>> {
+        let mut output = std::mem::take(&mut self.failures);
+        for (info, text) in self.infos.iter().zip(rendered) {
+            let mut content = if info.hidden {
+                Content::empty()
+            } else {
+                TextElem::packed(text.clone()).spanned(info.span)
+            };
+
+            if !info.hidden && self.database.is_note_style() {
+                content = FootnoteElem::with_content(content).pack();
+            }
+
+            output.insert(info.location, Ok(content));
+        }
+
+        output
+    }
+
+    /// Display the Citum bibliography entries as Typst content.
+    #[allow(clippy::type_complexity)]
+    fn display_references(
+        &self,
+        processor: &citum_engine::Processor,
+    ) -> Vec<(Option<Content>, Content, Location)> {
+        let full = self.bibliography.full.get(StyleChain::default());
+        let ids: Vec<String> = if full {
+            self.database.iter_keys().map(str::to_string).collect()
+        } else {
+            let mut seen = FxHashSet::default();
+            self.cited
+                .iter()
+                .filter(|id| seen.insert((*id).clone()))
+                .cloned()
+                .collect()
+        };
+
+        let rendered = processor
+            .render_selected_bibliography_with_format::<
+                citum_engine::render::plain::PlainText,
+                _,
+            >(ids);
+
+        let location = self.bibliography.location().unwrap();
+        rendered
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .enumerate()
+            .map(|(k, line)| {
+                (
+                    None,
+                    TextElem::packed(line.to_owned()).spanned(self.bibliography.span()),
+                    location.variant(k + 1),
+                )
+            })
+            .collect()
     }
 }
 
