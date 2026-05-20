@@ -66,9 +66,45 @@ hi:
 // Error: 48-58 expected "hayagriva" or "citum"
 #bibliography("/assets/bib/works.bib", engine: "not-real")
 
---- bibliography-engine-citum-unsupported eval ---
-// Error: 15-38 citation engine "citum" is reserved but not yet available
+--- bibliography-engine-citum-missing-style eval ---
+// Error: 15-38 citation engine "citum" requires a style
 #bibliography("/assets/bib/works.bib", engine: "citum")
+
+--- bibliography-engine-citum-basic paged ---
+#set page(width: 180pt)
+
+#let refs = ```yaml
+kuhn1962:
+  class: monograph
+  id: kuhn1962
+  type: book
+  title: The Structure of Scientific Revolutions
+  issued: "1962"
+```
+
+#let style = ```yaml
+info:
+  title: Typst Citum Test
+options:
+  processing: author-date
+citation:
+  non-integral:
+    wrap:
+      punctuation: parentheses
+    template:
+      - title: primary
+  integral:
+    template:
+      - title: primary
+bibliography:
+  template:
+    - title: primary
+```
+
+#cite(<kuhn1962>, form: "prose") says so.
+
+@kuhn1962
+#bibliography(bytes(refs.text), engine: "citum", style: bytes(style.text), title: none)
 
 --- bibliography-duplicate-key eval ---
 // Error: 15-65 duplicate bibliography keys: netwok, issue201, arrgh, quark, distress, glacier-melt, tolkien54, DBLP:books/lib/Knuth86a, sharing, restful, mcintosh_anxiety, psychology25

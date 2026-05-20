@@ -31,6 +31,7 @@ either = { workspace = true }
 flate2 = { workspace = true }
 fontdb = { workspace = true }
 glidesort = { workspace = true }
+citum-engine = { workspace = true }
 hayagriva = { workspace = true }
 hayro-syntax = { workspace = true }
 icu_properties = { workspace = true }

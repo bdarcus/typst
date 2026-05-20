@@ -24,6 +24,7 @@ fe5a4ef28f152f504fa01046f2fb9438 baseline-text
 2aaceabd952671676e58375e09f94467 bibliography-before-content
 306844e5544ff0f98754bbaaf6d44bf2 bibliography-csl-display
 6094fb31493ca393f6466d716176c27d bibliography-custom-title
+c92b8384d6d620dff617ba7703a9400d bibliography-engine-citum-basic
 1e885058308a6ccd4f54b53d1770c254 bibliography-full
 44cc2073c504b643556c3d44b115b3b1 bibliography-grid-par
 b74d98de46c2d1dc3c644959a7f60560 bibliography-indent-par

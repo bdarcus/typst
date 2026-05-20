@@ -50,6 +50,7 @@ codespan-reporting = "0.11"
 codex = { git = "https://github.com/typst/codex", rev = "0426b6a" }
 color-print = "0.3.6"
 comemo = "0.5.1"
+citum-engine = "0.53.3"
 csv = "1"
 ctrlc = "3.4.1"
 dirs = "6"
